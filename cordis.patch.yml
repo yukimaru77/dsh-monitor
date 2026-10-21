@@ -1,0 +1,3 @@
+- insert:
+    - id: monitor
+      name: dsh-monitor

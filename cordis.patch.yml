@@ -1,3 +1,8 @@
 - insert:
     - id: monitor
       name: dsh-monitor
+# Foreground bash waits 10 s; a longer command keeps running as a job and is
+# reported every 30 minutes by dsh-monitor and on completion by dsh-tool-jobs.
+- id: bash-sandbox
+  config:
+    timeoutMs: 10000

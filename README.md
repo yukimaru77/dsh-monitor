@@ -42,8 +42,8 @@
 dsh plugin --profile web add "file:$PWD"
 ```
 
-全presetのセッションで使えます。コマンドはDSHのworking directoryで、ユーザーのシェル（`$SHELL -lc`）により実行されます。
-Pi版と同じくDSHのsandboxは通りません。
+全presetのセッションで使えます。
+
 
 ## テスト
 

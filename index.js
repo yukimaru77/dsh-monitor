@@ -1,12 +1,16 @@
-// DSH port of pi-event-monitor-batched (MIT): path watchers, plus 30-minute
-// reports for bash commands that outlive their foreground timeout and keep
-// running as jobs. Delivery uses DSH's agent inbox.
+// DSH port of pi-event-monitor-batched (MIT): background shell monitors that
+// wake the session that started them, plus 30-minute reports for bash commands
+// that outlive their foreground timeout and keep running as jobs. Notifications,
+// batching, limits and tool names follow the Pi extension; delivery uses DSH's
+// agent inbox. Paths are watched with a command (fswatch, inotifywait).
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
-import { BoundedLines, OutputBatch } from "./batch.js";
+import { BoundedLines, OutputBatch, intervalMilliseconds, MAX_INTERVAL_MINUTES } from "./batch.js";
 
 export const name = "monitor";
 export const inject = ["tools", "commands", "agents", "workingDirectory", "jobs"];
@@ -16,6 +20,7 @@ export const JOB_REPORT_INTERVAL_MS = 30 * 60_000;
 
 const MAX_LINE_CHARS = 4_000;
 const MAX_BATCH_CHARS = 20_000;
+const MAX_STDERR_BYTES = 1_000_000;
 
 function clampTimeout(timeoutMs) {
 	if (!Number.isFinite(timeoutMs ?? NaN)) return 300_000;
@@ -25,10 +30,6 @@ function clampTimeout(timeoutMs) {
 function clampRate(value, fallback, max) {
 	if (!Number.isFinite(value ?? NaN)) return fallback;
 	return Math.min(max, Math.max(1, Math.floor(value)));
-}
-
-function stripAtPrefix(value) {
-	return value.startsWith("@") ? value.slice(1) : value;
 }
 
 function formatAge(startedAt) {
@@ -42,7 +43,8 @@ function formatAge(startedAt) {
 
 function summarizeMonitor(monitor) {
 	const base = `${monitor.id} [${monitor.status}] ${monitor.kind} "${monitor.description}" age=${formatAge(monitor.startedAt)} events=${monitor.eventCount} lines=${monitor.totalLineCount}`;
-	return `${base} path=${monitor.watchPath} recursive=${monitor.recursive}`;
+	const stderr = monitor.stderrFile ? ` stderr=${monitor.stderrFile}` : "";
+	return `${base} interval_minutes=${monitor.intervalMs / 60_000} summary=first3+last20+exit pid=${monitor.pid ?? "?"} command=${JSON.stringify(monitor.command)}${stderr}`;
 }
 
 function truncateLine(line) {
@@ -63,6 +65,16 @@ function capBatch(lines) {
 		chars += next.length + 1;
 	}
 	return capped;
+}
+
+function killProcessTree(child, signal) {
+	if (!child.pid) return;
+	try {
+		if (process.platform !== "win32") process.kill(-child.pid, signal);
+		else child.kill(signal);
+	} catch {
+		try { child.kill(signal); } catch { /* already gone */ }
+	}
 }
 
 const text = { schema: { type: "string" }, render: (_args, value) => [{ type: "text", text: value }] };
@@ -152,14 +164,8 @@ export function apply(ctx, config = {}) {
 	}
 
 	function flushPending(monitor) {
-		if (monitor.flushTimer) clearTimeout(monitor.flushTimer);
-		monitor.flushTimer = undefined;
-		sendWakeup(monitor, monitor.pendingLines.splice(0, monitor.pendingLines.length));
-	}
-
-	function scheduleFlush(monitor) {
-		if (monitor.flushTimer) return;
-		monitor.flushTimer = setTimeout(() => flushPending(monitor), 200);
+		monitor.flushPartial?.();
+		sendWakeup(monitor, monitor.batch.drain());
 	}
 
 	function recordLines(monitor, lines) {
@@ -171,57 +177,102 @@ export function apply(ctx, config = {}) {
 		}
 		monitor.windowLineCount += lines.length;
 		monitor.totalLineCount += lines.length;
+		for (const line of lines) monitor.batch.add(line);
 		if (monitor.windowLineCount > monitor.maxLinesPerMinute) {
-			monitor.stop(`safety stop: exceeded ${monitor.maxLinesPerMinute} lines/events per minute`);
-			return;
+			monitor.stop(`safety stop: exceeded ${monitor.maxLinesPerMinute} lines per minute`);
 		}
-		monitor.pendingLines.push(...lines.map(truncateLine));
-		scheduleFlush(monitor);
 	}
 
 	function finalizeStop(monitor, reason) {
 		if (monitor.status === "stopped") return;
-		flushPending(monitor);
-		const notifyPathStop = !monitor.suppressWakeups;
+		if (monitor.intervalTimer) clearInterval(monitor.intervalTimer);
+		monitor.intervalTimer = undefined;
+		monitor.flushPartial?.();
+		sendWakeup(monitor, [...monitor.batch.drain(), `Monitor ${monitor.id} stopped: ${reason}`]);
 		monitor.status = "stopped";
 		if (monitor.stopTimer) clearTimeout(monitor.stopTimer);
 		monitor.stopTimer = undefined;
-		if (notifyPathStop) deliver(monitor, `Monitor ${monitor.id} stopped: ${reason}`);
 	}
 
-	async function startPathMonitor(params, owner, cwd) {
+	async function ensureStderrFile(id) {
+		const dir = await fsp.mkdtemp(path.join(os.tmpdir(), "dsh-monitor-"));
+		await fsp.chmod(dir, 0o700).catch(() => undefined);
+		return path.join(dir, `${id}.stderr.log`);
+	}
+
+	async function startShellMonitor(params, owner, cwd) {
+		const intervalMs = intervalMilliseconds(params.interval_minutes);
 		const id = `mon-${nextId++}`;
-		const absolutePath = path.resolve(cwd, stripAtPrefix(params.path));
-		let stat;
-		try { stat = await fsp.stat(absolutePath); }
-		catch (error) { throw new Error(`Unable to watch ${absolutePath}: ${error instanceof Error ? error.message : String(error)}`); }
-		const watchIsDirectory = stat.isDirectory();
-		const recursive = watchIsDirectory ? (params.recursive ?? false) : false;
-		let watcher;
-		try { watcher = fs.watch(absolutePath, { recursive }); }
-		catch (error) { throw new Error(`Unable to watch ${absolutePath}: ${error instanceof Error ? error.message : String(error)}`); }
+		const stderrFile = await ensureStderrFile(id);
+		const stderrStream = fs.createWriteStream(stderrFile, { flags: "wx", mode: 0o600 });
+		const shell = process.env.SHELL || "/bin/sh";
+		const child = spawn(shell, ["-lc", params.command], {
+			cwd,
+			env: process.env,
+			stdio: ["ignore", "pipe", "pipe"],
+			detached: process.platform !== "win32",
+		});
 		const monitor = {
-			id, kind: "path", owner, description: params.description, watchPath: absolutePath, recursive, watchIsDirectory,
+			id, kind: "shell", owner, description: params.description, command: params.command,
 			startedAt: Date.now(), status: "running", eventCount: 0, totalLineCount: 0, windowLineCount: 0,
-			maxLinesPerMinute: clampRate(params.maxEventsPerMinute, 120, 2000), windowStartedAt: Date.now(),
-			pendingLines: [], instruction: params.instruction, watcher,
+			maxLinesPerMinute: params.maxLinesPerMinute === undefined ? Infinity : clampRate(params.maxLinesPerMinute, 60, 1000),
+			windowStartedAt: Date.now(), batch: new OutputBatch(), intervalMs,
+			stderrFile, instruction: params.instruction, process: child, pid: child.pid,
 			stop(reason) {
-				watcher.close();
-				finalizeStop(monitor, reason);
+				if (monitor.status !== "running") return;
+				monitor.status = "stopping";
+				monitor.stopReason = reason;
+				if (monitor.intervalTimer) clearInterval(monitor.intervalTimer);
+				monitor.intervalTimer = undefined;
+				if (monitor.stopTimer) clearTimeout(monitor.stopTimer);
+				killProcessTree(child, "SIGTERM");
+				monitor.killTimer = setTimeout(() => {
+					killProcessTree(child, "SIGKILL");
+					monitor.killTimer = undefined;
+				}, 3_000);
 			},
 		};
-		watcher.on("change", (eventType, filename) => {
-			const target = filename
-				? watchIsDirectory ? path.join(absolutePath, filename.toString()) : path.join(path.dirname(absolutePath), filename.toString())
-				: absolutePath;
-			recordLines(monitor, [`${eventType}: ${target}`]);
-			if (eventType === "rename") {
-				void fsp.access(absolutePath).catch(() => monitor.stop(`watched path no longer exists: ${absolutePath}`));
+		monitors.set(id, monitor);
+		let stderrLogFailed = false;
+		stderrStream.on("error", (error) => {
+			stderrLogFailed = true;
+			recordLines(monitor, [`stderr log error: ${error.message}`]);
+			monitor.stop("stderr log write failed");
+		});
+		const stdoutLines = new BoundedLines((line) => recordLines(monitor, [line]));
+		const stderrLines = new BoundedLines((line) => recordLines(monitor, [line]));
+		monitor.flushPartial = () => { stdoutLines.flush(); stderrLines.flush(); };
+		monitor.intervalTimer = setInterval(() => flushPending(monitor), intervalMs);
+		child.stdout.on("data", (chunk) => stdoutLines.write(chunk));
+		let stderrBytes = 0;
+		let stderrTruncated = false;
+		child.stderr.on("data", (chunk) => {
+			const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+			stderrLines.write(buffer);
+			const remaining = MAX_STDERR_BYTES - stderrBytes;
+			if (remaining > 0 && !stderrLogFailed) stderrStream.write(buffer.subarray(0, remaining));
+			stderrBytes += buffer.length;
+			if (stderrBytes > MAX_STDERR_BYTES && !stderrTruncated) {
+				stderrTruncated = true;
+				if (!stderrLogFailed) stderrStream.write(`\n[stderr truncated at ${MAX_STDERR_BYTES} bytes]\n`);
 			}
 		});
-		watcher.on("error", (error) => monitor.stop(`watch error: ${error.message}`));
-		monitors.set(id, monitor);
-		if (params.persistent === false) {
+		child.on("error", (error) => {
+			if (!stderrLogFailed) stderrStream.write(`\n[spawn error] ${error.message}\n`);
+			monitor.stop(`spawn error: ${error.message}`);
+		});
+		child.on("close", (code, signal) => {
+			stdoutLines.end();
+			stderrLines.end();
+			stderrStream.end();
+			if (monitor.killTimer) {
+				clearTimeout(monitor.killTimer);
+				monitor.killTimer = undefined;
+				killProcessTree(child, "SIGKILL");
+			}
+			finalizeStop(monitor, `${monitor.stopReason ? `${monitor.stopReason}; ` : ""}process exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+		});
+		if (params.timeoutMs !== undefined || params.persistent === false) {
 			monitor.stopTimer = setTimeout(() => monitor.stop("timeout"), clampTimeout(params.timeoutMs));
 		}
 		return monitor;
@@ -265,22 +316,22 @@ export function apply(ctx, config = {}) {
 	});
 
 	ctx.effect(() => ctx.tools.register(defineTool({
-		name: "monitor_watch_path",
-		description: "Watch a local file or directory and wake this session on changes. For complex filters, run fswatch/inotifywait/find with bash; a command that keeps running is reported as a job.",
+		name: "monitor_start",
+		description: "Run a background shell monitor. Every 30 minutes by default, wake this session with the first 3 and last 20 stdout/stderr lines since the previous notification, marking omitted lines. Lines are capped at 256 UTF-8 bytes. Empty intervals are silent. Exit or manual stop sends remaining output and exit status in one final wakeup. No default timeout or flood cutoff. Stderr is also saved to a bounded temp log. Use it when the user asks to watch logs, dev servers, CI, tests, deploys, or external processes.",
 		parameters: {
-			description: { type: "string", required: true, description: "Short human-readable label for the path watcher." },
-			path: { type: "string", required: true, description: "File or directory to watch, relative to the current working directory unless absolute." },
-			recursive: { type: "boolean", description: "Watch directories recursively when supported by Node on this platform." },
-			persistent: { type: "boolean", description: "If true, run until manually stopped or session end. Default true." },
-			timeoutMs: { type: "number", description: "Auto-stop after this many milliseconds when persistent is false. Default 300000. Max 3600000." },
-			maxEventsPerMinute: { type: "number", description: "Safety valve: stop the watcher if more than this many file events arrive in one minute. Default 120." },
-			instruction: { type: "string", description: "Optional instruction appended to every wake-up message." },
+			description: { type: "string", required: true, description: "Short human-readable label for the monitor." },
+			command: { type: "string", required: true, description: "Shell command to run in the background. Stdout and stderr are summarized at fixed intervals and on exit." },
+			interval_minutes: { type: "number", description: "Notification interval in minutes. Default 30. Empty intervals are silent; exit always sends remaining output and status." },
+			timeoutMs: { type: "number", description: "Explicit auto-stop deadline in milliseconds, even when persistent is true. No timeout by default; persistent:false defaults to 300000. Max 3600000." },
+			persistent: { type: "boolean", description: "Default true: run until exit, manual stop, or session end unless timeoutMs is provided. False defaults to a 5-minute timeout." },
+			maxLinesPerMinute: { type: "number", description: "Optional safety valve: stop if stdout and stderr exceed this many lines per minute. Disabled by default." },
+			instruction: { type: "string", description: "Optional instruction appended to every wake-up message, e.g. 'Fix test failures immediately.'" },
 		},
 		output: text,
 		async execute(args, exec) {
-			const agent = requireAgent(exec, "monitor_watch_path");
-			const monitor = await startPathMonitor(args, agent, await cwdOf(agent, exec.signal));
-			return `Started path watcher ${monitor.id}: ${monitor.description}\n${summarizeMonitor(monitor)}`;
+			const agent = requireAgent(exec, "monitor_start");
+			const monitor = await startShellMonitor(args, agent, await cwdOf(agent, exec.signal));
+			return `Started monitor ${monitor.id}: ${monitor.description}\n${summarizeMonitor(monitor)}`;
 		},
 	})));
 
@@ -315,15 +366,16 @@ export function apply(ctx, config = {}) {
 	const success = (text) => ({ kind: "success", text });
 
 	ctx.effect(() => ctx.commands.register({
-		name: "monitor-watch",
-		description: "Watch a path: /monitor-watch <path> [description]",
-		input: { hint: "<path> [description]" },
+		name: "monitor",
+		description: "Start a shell monitor: /monitor <description> :: <command>",
+		input: { hint: "<description> :: <command>" },
 		async handler({ agent, rawInput, signal }) {
 			const raw = rawInput.trim();
-			if (!raw) return error("Usage: /monitor-watch <path> [description]");
-			const [watchPath, ...rest] = raw.split(/\s+/);
-			const description = rest.join(" ").trim() || `changes in ${watchPath}`;
-			const monitor = await startPathMonitor({ description, path: watchPath, persistent: true }, agent, await cwdOf(agent, signal));
+			const separator = raw.indexOf("::");
+			const description = separator < 0 ? "" : raw.slice(0, separator).trim();
+			const command = separator < 0 ? "" : raw.slice(separator + 2).trim();
+			if (!description || !command) return error("Usage: /monitor <description> :: <command>");
+			const monitor = await startShellMonitor({ description, command, persistent: true }, agent, await cwdOf(agent, signal));
 			return success(`Started ${monitor.id}`);
 		},
 	}));

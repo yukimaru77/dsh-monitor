@@ -56,10 +56,57 @@ async function until(predicate, ms = 5000) {
   while (!predicate()) { if (Date.now() > end) throw new Error('timed out'); await delay(20); }
 }
 
-test('keeps only path watching tools and commands; shell commands are reported as jobs', t => {
+test('offers command monitors only; paths are watched with a command', t => {
   const h = harness(process.cwd()); t.after(h.dispose);
-  assert.deepEqual([...h.tools.keys()], ['monitor_watch_path', 'monitor_list', 'monitor_stop']);
-  assert.deepEqual([...h.commands.keys()], ['monitor-watch', 'monitors', 'monitor-stop']);
+  assert.deepEqual([...h.tools.keys()], ['monitor_start', 'monitor_list', 'monitor_stop']);
+  assert.deepEqual([...h.commands.keys()], ['monitor', 'monitors', 'monitor-stop']);
+});
+
+test('a finished command wakes an idle session once with its output and exit status', async t => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-monitor-test-')); t.after(() => rm(dir, { recursive: true, force: true }));
+  const h = harness(dir); t.after(h.dispose);
+  const owner = h.agent('session-1', 'idle');
+  const started = await h.call('monitor_start', { description: 'build', command: 'pwd; echo out; echo err >&2; exit 3', instruction: 'Fix it.' }, owner);
+  assert.match(started, /^Started monitor mon-1: build/);
+  await until(() => owner.delivered.length === 1);
+  const [mode, message] = owner.delivered[0];
+  assert.equal(mode, 'followup');
+  assert.equal(message.source.kind, 'monitor');
+  const body = textOf(message);
+  assert.match(body, /untrusted external data/);
+  assert.match(body, /Handling instruction: Fix it\./);
+  assert.ok(body.includes(`| ${await import('node:fs').then(fs => fs.realpathSync(dir))}`) || body.includes(`| ${dir}`), 'runs in the session working directory');
+  assert.match(body, /\| out\n/);
+  assert.match(body, /\| err\n/);
+  assert.match(body, /Monitor mon-1 stopped: process exited code=3 signal=null/);
+  assert.match(await h.call('monitor_list', { status: 'stopped' }, owner), /mon-1 \[stopped\] shell "build"/);
+});
+
+test('interval batches go to a busy session by injection and empty intervals stay silent', async t => {
+  const h = harness(process.cwd()); t.after(h.dispose);
+  const owner = h.agent('session-1', 'running');
+  await h.call('monitor_start', { description: 'ticks', command: 'echo one; sleep 1; sleep 1', interval_minutes: 0.005 }, owner);
+  await until(() => owner.delivered.length >= 1);
+  await delay(700);
+  assert.equal(owner.delivered.length, 1, 'later empty intervals send nothing');
+  assert.equal(owner.delivered[0][0], 'inject');
+  assert.match(textOf(owner.delivered[0][1]), /\| one/);
+  assert.equal((await h.run('monitor-stop', ' all', owner)).text, 'Stopped 1 monitor(s).');
+  await until(() => owner.delivered.length === 2);
+  assert.match(textOf(owner.delivered[1][1]), /stopped: manual stop; process exited/);
+});
+
+test('monitors belong to their session: others cannot list or stop them, and session end stops them silently', async t => {
+  const h = harness(process.cwd()); t.after(h.dispose);
+  const a = h.agent('a'), b = h.agent('b');
+  const result = await h.run('monitor', ' sleeper :: sleep 30', a);
+  assert.deepEqual(result, { kind: 'success', text: 'Started mon-1' });
+  assert.equal(await h.call('monitor_list', {}, b), 'No running monitors.');
+  assert.equal(await h.call('monitor_stop', { id: 'mon-1' }, b), 'No monitor found with id mon-1.');
+  h.listeners.get('agent/disposed')({ agent: a });
+  await delay(300);
+  assert.equal(a.delivered.length, 0, 'no wakeup to an ended session');
+  assert.equal((await h.run('monitor', ' missing separator', a)).kind, 'error');
 });
 
 test('a running bash job reports unread output with its job id each interval; empty intervals are silent', async t => {
@@ -98,30 +145,4 @@ test('non-bash jobs and unowned jobs are not reported', async t => {
   h.jobs.write('bash-x', 'x\n');
   await delay(100);
   assert.equal(owner.delivered.length, 0);
-});
-
-test('monitors belong to their session: others cannot list or stop them, and session end stops them silently', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-monitor-own-')); t.after(() => rm(dir, { recursive: true, force: true }));
-  const h = harness(dir); t.after(h.dispose);
-  const a = h.agent('a'), b = h.agent('b');
-  assert.deepEqual(await h.run('monitor-watch', ' . watched', a), { kind: 'success', text: 'Started mon-1' });
-  assert.equal(await h.call('monitor_list', {}, b), 'No running monitors.');
-  assert.equal(await h.call('monitor_stop', { id: 'mon-1' }, b), 'No monitor found with id mon-1.');
-  h.listeners.get('agent/disposed')({ agent: a });
-  await writeFile(join(dir, 'late.txt'), 'x');
-  await delay(300);
-  assert.equal(a.delivered.length, 0, 'no wakeup to an ended session');
-});
-
-test('path watcher reports changes and a stop notice', async t => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-monitor-watch-')); t.after(() => rm(dir, { recursive: true, force: true }));
-  const h = harness(dir); t.after(h.dispose);
-  const owner = h.agent();
-  assert.deepEqual(await h.run('monitor-watch', ' . config dir', owner), { kind: 'success', text: 'Started mon-1' });
-  await delay(100);
-  await writeFile(join(dir, 'a.txt'), 'x');
-  await until(() => owner.delivered.length >= 1);
-  assert.match(textOf(owner.delivered[0][1]), /a\.txt/);
-  await h.call('monitor_stop', { id: 'mon-1' }, owner);
-  await until(() => owner.delivered.some(([, m]) => /Monitor mon-1 stopped: manual stop/.test(textOf(m))));
 });

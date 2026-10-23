@@ -13,10 +13,18 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import { BoundedLines, OutputBatch, intervalMilliseconds, MAX_INTERVAL_MINUTES } from "./batch.js";
 
 export const name = "monitor";
-export const inject = ["tools", "commands", "agents", "workingDirectory", "jobs"];
+export const inject = ["tools", "commands", "agents", "workingDirectory", "jobs", "systemPrompt"];
 
 /** Interval of the running-job reports; jobs.reportIntervalMs in tests. */
 export const JOB_REPORT_INTERVAL_MS = 30 * 60_000;
+
+/** How bash jobs and monitors report back, for the model (bash's own description cannot be changed). */
+export const SHELL_GUIDANCE = [
+	"<shell-commands>",
+	"- bash waits up to 10 seconds. A command still running then keeps running as a background job: you get its output so far and a job id. While it runs, its new output is delivered here every 30 minutes, and you are notified when it finishes. Continue with other work instead of blocking on job_output with wait; read it with job_output only when you need the output now.",
+	"- monitor_start is for a command whose output you want to react to as it appears (logs, dev servers, CI, file changes via fswatch): each burst of output wakes you right away. Every wake-up is added to this conversation, so a command that prints continuously wakes you endlessly and fills the context. Filter the command to the lines that matter (for example grep --line-buffered), use interval_minutes for periodic summaries of chatty output, and stop monitors you no longer need with monitor_stop.",
+	"</shell-commands>",
+].join("\n");
 
 const MAX_LINE_CHARS = 4_000;
 const MAX_BATCH_CHARS = 20_000;
@@ -330,12 +338,14 @@ export function apply(ctx, config = {}) {
 		monitors.clear();
 	});
 
+	ctx.effect(() => ctx.systemPrompt.context({ name: "shell-commands", order: 120, text: () => SHELL_GUIDANCE }));
+
 	ctx.effect(() => ctx.tools.register(defineTool({
 		name: "monitor_start",
-		description: "Run a background shell monitor. As output appears, wake this session with each burst (lines arriving within 200 ms; the first 3 and last 20 lines of a burst, marking omitted lines); interval_minutes switches to periodic summaries. Filter the command (e.g. grep --line-buffered) so only relevant lines wake the session. Lines are capped at 256 UTF-8 bytes. Empty intervals are silent. Exit or manual stop sends remaining output and exit status in one final wakeup. No default timeout or flood cutoff. Stderr is also saved to a bounded temp log. Use it when the user asks to watch logs, dev servers, CI, tests, deploys, or external processes.",
+		description: "Run a background shell monitor. As output appears, wake this session with each burst (lines arriving within 200 ms; the first 3 and last 20 lines of a burst, marking omitted lines); interval_minutes switches to periodic summaries. Every wake-up is added to the conversation: a command that prints continuously wakes the session endlessly and fills its context, so filter the command (e.g. grep --line-buffered) to the lines that matter, or set interval_minutes for chatty output. Lines are capped at 256 UTF-8 bytes. Empty intervals are silent. Exit or manual stop sends remaining output and exit status in one final wakeup. No default timeout or flood cutoff. Stderr is also saved to a bounded temp log. Use it when the user asks to watch logs, dev servers, CI, tests, deploys, or external processes.",
 		parameters: {
 			description: { type: "string", required: true, description: "Short human-readable label for the monitor." },
-			command: { type: "string", required: true, description: "Shell command to run in the background. Stdout and stderr are summarized at fixed intervals and on exit." },
+			command: { type: "string", required: true, description: "Shell command to run in the background. Each burst of stdout/stderr is sent as it appears (or summarized every interval_minutes), and the rest on exit. Prefer commands that print only the lines worth reacting to." },
 			interval_minutes: { type: "number", description: "Optional: summarize output every N minutes instead of right away. Empty intervals are silent; exit always sends remaining output and status." },
 			timeoutMs: { type: "number", description: "Explicit auto-stop deadline in milliseconds, even when persistent is true. No timeout by default; persistent:false defaults to 300000. Max 3600000." },
 			persistent: { type: "boolean", description: "Default true: run until exit, manual stop, or session end unless timeoutMs is provided. False defaults to a 5-minute timeout." },

@@ -28,6 +28,7 @@ function fakeJobs() {
 function harness(cwd, options = {}) {
   const tools = new Map(), commands = new Map(), listeners = new Map(), cleanups = [];
   const agents = new Map();
+  const contexts = new Map();
   const jobs = fakeJobs();
   const ctx = {
     on: (event, fn) => { listeners.set(event, fn); return () => listeners.delete(event); },
@@ -37,6 +38,7 @@ function harness(cwd, options = {}) {
     workingDirectory: { ensure: async () => cwd },
     agents: { get: id => agents.get(id) },
     jobs,
+    systemPrompt: { context: c => { contexts.set(c.name, c); return () => contexts.delete(c.name); } },
   };
   apply(ctx, options);
   const agent = (id = 'session-1', status = 'idle') => {
@@ -48,7 +50,7 @@ function harness(cwd, options = {}) {
   const call = (name, args, owner) => tools.get(name).execute(args, { agent: owner, signal: new AbortController().signal });
   const run = (name, rawInput, owner) => commands.get(name).handler({ agent: owner, rawInput, signal: new AbortController().signal });
   const dispose = () => { for (const cleanup of cleanups.reverse()) cleanup(); };
-  return { tools, commands, listeners, agent, call, run, dispose, jobs };
+  return { tools, commands, listeners, agent, call, run, dispose, jobs, contexts };
 }
 const textOf = message => message.content.map(block => block.text).join('');
 async function until(predicate, ms = 5000) {
@@ -60,6 +62,16 @@ test('offers command monitors only; paths are watched with a command', t => {
   const h = harness(process.cwd()); t.after(h.dispose);
   assert.deepEqual([...h.tools.keys()], ['monitor_start', 'monitor_list', 'monitor_stop']);
   assert.deepEqual([...h.commands.keys()], ['monitor', 'monitors', 'monitor-stop']);
+});
+
+test('the model is told how bash jobs and monitors report back, and to keep monitors quiet', t => {
+  const h = harness(process.cwd()); t.after(h.dispose);
+  const text = h.contexts.get('shell-commands').text();
+  assert.match(text, /bash waits up to 10 seconds/);
+  assert.match(text, /every 30 minutes/);
+  assert.match(text, /instead of blocking on job_output/);
+  assert.match(text, /prints continuously wakes you endlessly and fills the context/);
+  assert.match(h.tools.get('monitor_start').description, /fills its context/);
 });
 
 test('a finished command wakes an idle session with its output and exit status', async t => {

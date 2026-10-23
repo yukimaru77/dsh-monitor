@@ -21,6 +21,8 @@ export const JOB_REPORT_INTERVAL_MS = 30 * 60_000;
 const MAX_LINE_CHARS = 4_000;
 const MAX_BATCH_CHARS = 20_000;
 const MAX_STDERR_BYTES = 1_000_000;
+/** Output lines arriving within this window form one notification. */
+const BURST_MS = 200;
 
 function clampTimeout(timeoutMs) {
 	if (!Number.isFinite(timeoutMs ?? NaN)) return 300_000;
@@ -44,7 +46,7 @@ function formatAge(startedAt) {
 function summarizeMonitor(monitor) {
 	const base = `${monitor.id} [${monitor.status}] ${monitor.kind} "${monitor.description}" age=${formatAge(monitor.startedAt)} events=${monitor.eventCount} lines=${monitor.totalLineCount}`;
 	const stderr = monitor.stderrFile ? ` stderr=${monitor.stderrFile}` : "";
-	return `${base} interval_minutes=${monitor.intervalMs / 60_000} summary=first3+last20+exit pid=${monitor.pid ?? "?"} command=${JSON.stringify(monitor.command)}${stderr}`;
+	return `${base} ${monitor.intervalMs === undefined ? "notify=on-output(200ms)" : `interval_minutes=${monitor.intervalMs / 60_000}`} summary=first3+last20+exit pid=${monitor.pid ?? "?"} command=${JSON.stringify(monitor.command)}${stderr}`;
 }
 
 function truncateLine(line) {
@@ -164,8 +166,17 @@ export function apply(ctx, config = {}) {
 	}
 
 	function flushPending(monitor) {
-		monitor.flushPartial?.();
+		if (monitor.flushTimer) clearTimeout(monitor.flushTimer);
+		monitor.flushTimer = undefined;
+		// A burst holds back an unfinished line until it ends; periodic summaries include it.
+		if (monitor.intervalMs !== undefined) monitor.flushPartial?.();
 		sendWakeup(monitor, monitor.batch.drain());
+	}
+
+	/** Without an interval, output is sent as it appears: lines within 200 ms form one notice. */
+	function scheduleFlush(monitor) {
+		if (monitor.flushTimer) return;
+		monitor.flushTimer = setTimeout(() => flushPending(monitor), BURST_MS);
 	}
 
 	function recordLines(monitor, lines) {
@@ -180,6 +191,8 @@ export function apply(ctx, config = {}) {
 		for (const line of lines) monitor.batch.add(line);
 		if (monitor.windowLineCount > monitor.maxLinesPerMinute) {
 			monitor.stop(`safety stop: exceeded ${monitor.maxLinesPerMinute} lines per minute`);
+		} else if (monitor.intervalMs === undefined) {
+			scheduleFlush(monitor);
 		}
 	}
 
@@ -187,6 +200,8 @@ export function apply(ctx, config = {}) {
 		if (monitor.status === "stopped") return;
 		if (monitor.intervalTimer) clearInterval(monitor.intervalTimer);
 		monitor.intervalTimer = undefined;
+		if (monitor.flushTimer) clearTimeout(monitor.flushTimer);
+		monitor.flushTimer = undefined;
 		monitor.flushPartial?.();
 		sendWakeup(monitor, [...monitor.batch.drain(), `Monitor ${monitor.id} stopped: ${reason}`]);
 		monitor.status = "stopped";
@@ -201,7 +216,7 @@ export function apply(ctx, config = {}) {
 	}
 
 	async function startShellMonitor(params, owner, cwd) {
-		const intervalMs = intervalMilliseconds(params.interval_minutes);
+		const intervalMs = params.interval_minutes === undefined ? undefined : intervalMilliseconds(params.interval_minutes);
 		const id = `mon-${nextId++}`;
 		const stderrFile = await ensureStderrFile(id);
 		const stderrStream = fs.createWriteStream(stderrFile, { flags: "wx", mode: 0o600 });
@@ -242,7 +257,7 @@ export function apply(ctx, config = {}) {
 		const stdoutLines = new BoundedLines((line) => recordLines(monitor, [line]));
 		const stderrLines = new BoundedLines((line) => recordLines(monitor, [line]));
 		monitor.flushPartial = () => { stdoutLines.flush(); stderrLines.flush(); };
-		monitor.intervalTimer = setInterval(() => flushPending(monitor), intervalMs);
+		if (intervalMs !== undefined) monitor.intervalTimer = setInterval(() => flushPending(monitor), intervalMs);
 		child.stdout.on("data", (chunk) => stdoutLines.write(chunk));
 		let stderrBytes = 0;
 		let stderrTruncated = false;
@@ -317,11 +332,11 @@ export function apply(ctx, config = {}) {
 
 	ctx.effect(() => ctx.tools.register(defineTool({
 		name: "monitor_start",
-		description: "Run a background shell monitor. Every 30 minutes by default, wake this session with the first 3 and last 20 stdout/stderr lines since the previous notification, marking omitted lines. Lines are capped at 256 UTF-8 bytes. Empty intervals are silent. Exit or manual stop sends remaining output and exit status in one final wakeup. No default timeout or flood cutoff. Stderr is also saved to a bounded temp log. Use it when the user asks to watch logs, dev servers, CI, tests, deploys, or external processes.",
+		description: "Run a background shell monitor. As output appears, wake this session with each burst (lines arriving within 200 ms; the first 3 and last 20 lines of a burst, marking omitted lines); interval_minutes switches to periodic summaries. Filter the command (e.g. grep --line-buffered) so only relevant lines wake the session. Lines are capped at 256 UTF-8 bytes. Empty intervals are silent. Exit or manual stop sends remaining output and exit status in one final wakeup. No default timeout or flood cutoff. Stderr is also saved to a bounded temp log. Use it when the user asks to watch logs, dev servers, CI, tests, deploys, or external processes.",
 		parameters: {
 			description: { type: "string", required: true, description: "Short human-readable label for the monitor." },
 			command: { type: "string", required: true, description: "Shell command to run in the background. Stdout and stderr are summarized at fixed intervals and on exit." },
-			interval_minutes: { type: "number", description: "Notification interval in minutes. Default 30. Empty intervals are silent; exit always sends remaining output and status." },
+			interval_minutes: { type: "number", description: "Optional: summarize output every N minutes instead of right away. Empty intervals are silent; exit always sends remaining output and status." },
 			timeoutMs: { type: "number", description: "Explicit auto-stop deadline in milliseconds, even when persistent is true. No timeout by default; persistent:false defaults to 300000. Max 3600000." },
 			persistent: { type: "boolean", description: "Default true: run until exit, manual stop, or session end unless timeoutMs is provided. False defaults to a 5-minute timeout." },
 			maxLinesPerMinute: { type: "number", description: "Optional safety valve: stop if stdout and stderr exceed this many lines per minute. Disabled by default." },

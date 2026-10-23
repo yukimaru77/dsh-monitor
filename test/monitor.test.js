@@ -62,17 +62,17 @@ test('offers command monitors only; paths are watched with a command', t => {
   assert.deepEqual([...h.commands.keys()], ['monitor', 'monitors', 'monitor-stop']);
 });
 
-test('a finished command wakes an idle session once with its output and exit status', async t => {
+test('a finished command wakes an idle session with its output and exit status', async t => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-monitor-test-')); t.after(() => rm(dir, { recursive: true, force: true }));
   const h = harness(dir); t.after(h.dispose);
   const owner = h.agent('session-1', 'idle');
   const started = await h.call('monitor_start', { description: 'build', command: 'pwd; echo out; echo err >&2; exit 3', instruction: 'Fix it.' }, owner);
   assert.match(started, /^Started monitor mon-1: build/);
-  await until(() => owner.delivered.length === 1);
+  await until(() => owner.delivered.some(([, m]) => /stopped: process exited/.test(textOf(m))));
   const [mode, message] = owner.delivered[0];
   assert.equal(mode, 'followup');
   assert.equal(message.source.kind, 'monitor');
-  const body = textOf(message);
+  const body = owner.delivered.map(([, m]) => textOf(m)).join('\n');
   assert.match(body, /untrusted external data/);
   assert.match(body, /Handling instruction: Fix it\./);
   assert.ok(body.includes(`| ${await import('node:fs').then(fs => fs.realpathSync(dir))}`) || body.includes(`| ${dir}`), 'runs in the session working directory');
@@ -80,6 +80,20 @@ test('a finished command wakes an idle session once with its output and exit sta
   assert.match(body, /\| err\n/);
   assert.match(body, /Monitor mon-1 stopped: process exited code=3 signal=null/);
   assert.match(await h.call('monitor_list', { status: 'stopped' }, owner), /mon-1 \[stopped\] shell "build"/);
+});
+
+test('by default each burst of output is sent as it appears', async t => {
+  const h = harness(process.cwd()); t.after(h.dispose);
+  const owner = h.agent('session-1', 'idle');
+  await h.call('monitor_start', { description: 'bursts', command: 'echo one; echo two; sleep 2; echo three; sleep 2' }, owner);
+  await until(() => owner.delivered.length === 1);
+  assert.match(textOf(owner.delivered[0][1]), /\| one\n\| two/);
+  assert.doesNotMatch(textOf(owner.delivered[0][1]), /three|stopped/);
+  await until(() => owner.delivered.length === 2);
+  assert.match(textOf(owner.delivered[1][1]), /\| three/);
+  assert.doesNotMatch(textOf(owner.delivered[1][1]), /one|stopped/);
+  await until(() => owner.delivered.length === 3);
+  assert.match(textOf(owner.delivered[2][1]), /stopped: process exited code=0/);
 });
 
 test('interval batches go to a busy session by injection and empty intervals stay silent', async t => {

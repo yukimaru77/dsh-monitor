@@ -26,6 +26,15 @@ export const SHELL_GUIDANCE = [
 	"</shell-commands>",
 ].join("\n");
 
+/** When an active goal may wait for its monitors and jobs instead of starting rounds (pi-goal-x GOAL_WAIT). */
+export const GOAL_WAIT_GUIDANCE = [
+	"<goal-wait>",
+	"- Monitor waiting: only when there is no useful independent work, deepening or investigation to advance now, and the results you need will arrive through a running monitor, end your final response with GOAL_WAIT. Running monitors include a bash command still running as a job past its 10-second wait (it reports every 30 minutes and when it finishes), so wait with GOAL_WAIT instead of polling it with job_output or sleep. The first GOAL_WAIT only asks you to confirm that nothing independent can advance; ending the next turn with GOAL_WAIT again, plus a running monitor or job, enters this wait. It suspends automatic goal rounds without pausing or completing the goal. A user message or a monitor or job notification releases it and continues the goal. Do not busy-poll or emit GOAL_WAIT without a running monitor or job.",
+	"</goal-wait>",
+].join("\n");
+export const GOAL_WAIT_CONFIRM = "GOAL_WAIT is not entered yet. Before waiting, check once more: is there really no independent work, deepening or investigation that can advance now, independent of what you are waiting for? If there is, do it now. If there is none, end this turn with GOAL_WAIT again; that enters the wait.";
+export const GOAL_WAIT_REFUSED = "GOAL_WAIT was not entered because no monitor is running (neither a monitor nor a still-running bash job). Continue useful goal work, or start a relevant monitor before ending with GOAL_WAIT. Do not claim to be waiting without a wake source.";
+
 const MAX_LINE_CHARS = 4_000;
 const MAX_BATCH_CHARS = 20_000;
 const MAX_STDERR_BYTES = 1_000_000;
@@ -332,6 +341,7 @@ export function apply(ctx, config = {}) {
 		const list = owned(agent);
 		stopForLifecycle(list, "session ended");
 		for (const monitor of list) if (monitor.status === "stopped") monitors.delete(monitor.id);
+		waits.delete(agent);
 	});
 	ctx.effect(() => () => {
 		stopForLifecycle([...monitors.values()], "monitor plugin unloaded");
@@ -339,6 +349,81 @@ export function apply(ctx, config = {}) {
 	});
 
 	ctx.effect(() => ctx.systemPrompt.context({ name: "shell-commands", order: 120, text: () => SHELL_GUIDANCE }));
+
+	// Goal waiting, as pi-goal-x GOAL_WAIT: a turn whose final response contains
+	// GOAL_WAIT, while a monitor or a bash job of this session is still running,
+	// first only asks the next turn to confirm that nothing independent can
+	// advance; when that next turn also ends with GOAL_WAIT, automatic goal rounds
+	// are disarmed; the goal stays active. The next turn
+	// opened by a user message or a monitor/job notification rearms it, so that
+	// turn continues the goal (and may wait again).
+	const waits = new Map();
+	const waitFor = (agent) => {
+		let wait = waits.get(agent);
+		if (!wait) { wait = { text: "", waiting: undefined, refused: false, confirming: false }; waits.set(agent, wait); }
+		return wait;
+	};
+	const goalOf = (agent) => { try { return ctx.get?.("goals")?.get(agent); } catch { return undefined; } };
+	function wakeSources(agent) {
+		const running = owned(agent).filter(isActive).length;
+		let jobs = 0;
+		try { jobs = ctx.jobs.list(agent.id).filter((job) => job.kind === "bash" && job.owner === agent.id && (job.status === "running" || job.status === "stopping")).length; } catch { /* no job registry */ }
+		return running + jobs;
+	}
+	ctx.on("session/event", (session, event) => {
+		const agent = ctx.agents.get(session.id);
+		if (agent === undefined || agent.session !== session) return;
+		const wait = waitFor(agent);
+		if (event.type === "turn/start") { wait.text = ""; return; }
+		// New user input needs a fresh confirmation before waiting.
+		if (event.type === "user/message" && event.data.source?.kind === "user") { wait.confirming = false; return; }
+		if (event.type === "assistant/message") {
+			wait.text = (event.data.message?.content ?? []).filter((block) => block?.type === "text").map((block) => block.text).join("\n");
+			return;
+		}
+		if (event.type !== "turn/end") return;
+		// A refusal is reported to the turn after it only.
+		wait.refused = false;
+		// Only consecutive turns confirm: any other ending drops a pending confirmation.
+		const confirmed = wait.confirming;
+		wait.confirming = false;
+		if (event.data.reason?.kind !== "completed" || !wait.text.includes("GOAL_WAIT")) return;
+		const goal = goalOf(agent);
+		if (goal === undefined || goal.phase !== "active") return;
+		if (wakeSources(agent) === 0) { wait.refused = true; return; }
+		// The first GOAL_WAIT leaves the goal armed: its next round carries the question.
+		if (!confirmed) { wait.confirming = true; return; }
+		// Disarming only changes process-local activation, so it is safe inside this dispatch,
+		// and it happens before the round driver looks for the next round at idle.
+		try { if (goal.activation === "armed") ctx.get("goals").disarm(agent); } catch (error) { ctx.logger?.warn?.(`monitor: could not enter GOAL_WAIT: ${error instanceof Error ? error.message : String(error)}`); return; }
+		wait.waiting = goal.id;
+	});
+	ctx.on("agent/status", ({ agent, status }) => {
+		const wait = waits.get(agent);
+		if (status !== "running" || wait?.waiting === undefined) return;
+		const goalId = wait.waiting;
+		wait.waiting = undefined;
+		const goal = goalOf(agent);
+		// A goal paused, blocked, completed or replaced meanwhile is left alone.
+		if (goal === undefined || goal.id !== goalId || goal.phase !== "active" || goal.activation === "armed") return;
+		try { ctx.get("goals").resume(agent, { id: goal.id, revision: goal.revision }); } catch (error) { ctx.logger?.warn?.(`monitor: could not end GOAL_WAIT: ${error instanceof Error ? error.message : String(error)}`); }
+	});
+	ctx.on("goal/changed", ({ agent, change }) => {
+		const wait = waits.get(agent);
+		if (wait && ["pause", "complete", "block", "clear"].includes(change?.operation)) wait.waiting = undefined;
+	});
+	ctx.effect(() => ctx.systemPrompt.context({
+		name: "goal-wait",
+		order: 131,
+		text: ({ scope } = {}) => {
+			const goal = scope === undefined ? undefined : goalOf(scope);
+			if (goal === undefined || goal.phase !== "active") return "";
+			const wait = waits.get(scope);
+			if (wait?.refused) return `${GOAL_WAIT_GUIDANCE}\n${GOAL_WAIT_REFUSED}`;
+			if (wait?.confirming) return `${GOAL_WAIT_GUIDANCE}\n${GOAL_WAIT_CONFIRM}`;
+			return GOAL_WAIT_GUIDANCE;
+		},
+	}));
 
 	ctx.effect(() => ctx.tools.register(defineTool({
 		name: "monitor_start",

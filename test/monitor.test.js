@@ -39,18 +39,20 @@ function harness(cwd, options = {}) {
     agents: { get: id => agents.get(id) },
     jobs,
     systemPrompt: { context: c => { contexts.set(c.name, c); return () => contexts.delete(c.name); } },
+    ...options.ctx,
   };
-  apply(ctx, options);
+  const { ctx: _extra, ...config } = options;
+  apply(ctx, config);
   const agent = (id = 'session-1', status = 'idle') => {
     const delivered = [];
-    const a = { status, delivered, followup: m => delivered.push(['followup', m]), inject: m => delivered.push(['inject', m]) };
+    const a = { id, session: { id }, status, delivered, followup: m => delivered.push(['followup', m]), inject: m => delivered.push(['inject', m]) };
     agents.set(id, a);
     return a;
   };
   const call = (name, args, owner) => tools.get(name).execute(args, { agent: owner, signal: new AbortController().signal });
   const run = (name, rawInput, owner) => commands.get(name).handler({ agent: owner, rawInput, signal: new AbortController().signal });
   const dispose = () => { for (const cleanup of cleanups.reverse()) cleanup(); };
-  return { tools, commands, listeners, agent, call, run, dispose, jobs, contexts };
+  return { tools, commands, listeners, agent, call, run, dispose, jobs, contexts, ctx };
 }
 const textOf = message => message.content.map(block => block.text).join('');
 async function until(predicate, ms = 5000) {
@@ -171,4 +173,117 @@ test('non-bash jobs and unowned jobs are not reported', async t => {
   h.jobs.write('bash-x', 'x\n');
   await delay(100);
   assert.equal(owner.delivered.length, 0);
+});
+
+/** One live goal per agent with the activation edges of @deepseek-ai/dsh-goal. */
+function fakeGoals() {
+  const goals = new Map(), log = [];
+  return {
+    log,
+    set: (agent, goal) => goals.set(agent, { id: 'goal-1', revision: 1, phase: 'active', activation: 'armed', ...goal }),
+    get: agent => goals.get(agent) && { ...goals.get(agent) },
+    disarm(agent) { log.push('disarm'); goals.get(agent).activation = 'disarmed'; },
+    resume(agent, ref) {
+      const goal = goals.get(agent);
+      assert.deepEqual(ref, { id: goal.id, revision: goal.revision });
+      log.push('resume'); goal.activation = 'armed'; goal.revision += 1;
+    },
+  };
+}
+function goalHarness() {
+  const goals = fakeGoals();
+  const h = harness(process.cwd(), { ctx: { get: name => (name === 'goals' ? goals : undefined), jobs: { ...fakeJobs(), list: () => listed } } });
+  let listed = [];
+  const owner = h.agent('session-1', 'idle');
+  const emit = event => h.listeners.get('session/event')(owner.session, event);
+  const turn = (text, reason = 'completed', { user = false, before = [] } = {}) => {
+    emit({ type: 'turn/start', data: { turn: 1 } });
+    if (user) emit({ type: 'user/message', data: { source: { kind: 'user' } } });
+    for (const step of before) emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: step }, { type: 'tool-call', name: 'read' }] } } });
+    emit({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } });
+    emit({ type: 'turn/end', data: { reason: { kind: reason } } });
+  };
+  /** A first GOAL_WAIT asks; the next turn ending with GOAL_WAIT enters the wait. */
+  const confirmedWait = text => { turn(text); turn(text); };
+  const status = s => h.listeners.get('agent/status')({ agent: owner, status: s });
+  return { ...h, goals, owner, turn, confirmedWait, status, setJobs: jobs => { listed = jobs; } };
+}
+
+test('GOAL_WAIT with a running bash job disarms goal rounds until the next turn rearms them', t => {
+  const h = goalHarness(); t.after(h.dispose);
+  h.goals.set(h.owner);
+  h.setJobs([{ id: 'job-1', kind: 'bash', owner: 'session-1', status: 'running' }]);
+  h.turn('The build runs in job-1.\nGOAL_WAIT');
+  assert.equal(h.goals.get(h.owner).activation, 'armed');
+  assert.match(h.contexts.get('goal-wait').text({ scope: h.owner }), /not entered yet[\s\S]*end this turn with GOAL_WAIT again/);
+  h.turn('Nothing independent remains.\nGOAL_WAIT');
+  assert.equal(h.goals.get(h.owner).activation, 'disarmed');
+  assert.equal(h.goals.get(h.owner).phase, 'active');
+  // The job notification opens a turn: the goal is rearmed and that turn continues it.
+  h.status('running');
+  assert.equal(h.goals.get(h.owner).activation, 'armed');
+  assert.deepEqual(h.goals.log, ['disarm', 'resume']);
+});
+
+test('GOAL_WAIT counts a running monitor of this session but not jobs of others or finished ones', async t => {
+  const h = goalHarness(); t.after(h.dispose);
+  h.goals.set(h.owner);
+  h.setJobs([{ id: 'job-1', kind: 'bash', owner: 'session-2', status: 'running' }, { id: 'job-2', kind: 'bash', owner: 'session-1', status: 'completed' }]);
+  h.confirmedWait('GOAL_WAIT');
+  assert.equal(h.goals.get(h.owner).activation, 'armed');
+  await h.call('monitor_start', { command: 'sleep 30', description: 'sleeper' }, h.owner);
+  h.confirmedWait('GOAL_WAIT');
+  assert.equal(h.goals.get(h.owner).activation, 'disarmed');
+  await h.call('monitor_stop', { id: '1' }, h.owner).catch(() => {});
+});
+
+test('GOAL_WAIT without a wake source stays armed and the next turn is told why', t => {
+  const h = goalHarness(); t.after(h.dispose);
+  h.goals.set(h.owner);
+  const context = () => h.contexts.get('goal-wait').text({ scope: h.owner });
+  assert.match(context(), /end your final response with GOAL_WAIT/);
+  assert.match(context(), /bash command still running as a job/);
+  assert.doesNotMatch(context(), /was not entered/);
+  h.turn('Waiting.\nGOAL_WAIT');
+  assert.deepEqual(h.goals.log, []);
+  assert.match(context(), /GOAL_WAIT was not entered because no monitor is running/);
+  h.turn('Did more work.');
+  assert.doesNotMatch(context(), /was not entered/);
+});
+
+test('GOAL_WAIT is ignored without an active goal, in aborted turns, and a goal paused while waiting stays paused', t => {
+  const h = goalHarness(); t.after(h.dispose);
+  h.setJobs([{ id: 'job-1', kind: 'bash', owner: 'session-1', status: 'running' }]);
+  h.turn('GOAL_WAIT');
+  assert.equal(h.contexts.get('goal-wait').text({ scope: h.owner }), '');
+  h.goals.set(h.owner);
+  h.turn('GOAL_WAIT');
+  h.turn('GOAL_WAIT', 'aborted');
+  h.turn('GOAL_WAIT');
+  assert.deepEqual(h.goals.log, []);
+  h.turn('GOAL_WAIT');
+  assert.deepEqual(h.goals.log, ['disarm']);
+  h.goals.set(h.owner, { phase: 'paused', activation: 'disarmed' });
+  h.status('running');
+  assert.deepEqual(h.goals.log, ['disarm']);
+  assert.equal(h.goals.get(h.owner).phase, 'paused');
+});
+
+test('GOAL_WAIT confirmation counts consecutive turns: tool steps inside a turn are fine, other turns and user input reset it', t => {
+  const h = goalHarness(); t.after(h.dispose);
+  h.goals.set(h.owner);
+  h.setJobs([{ id: 'job-1', kind: 'bash', owner: 'session-1', status: 'running' }]);
+  // The confirming turn may read files first; only its final response counts.
+  h.turn('GOAL_WAIT');
+  h.turn('Checked: nothing else.\nGOAL_WAIT', 'completed', { before: ['Let me look at the logs.', 'And the notes.'] });
+  assert.deepEqual(h.goals.log, ['disarm']);
+  h.status('running');
+  // A turn without GOAL_WAIT between them drops the pending confirmation.
+  h.turn('GOAL_WAIT'); h.turn('Found more to do.'); h.turn('GOAL_WAIT');
+  assert.deepEqual(h.goals.log, ['disarm', 'resume']);
+  // So does new user input in the confirming turn.
+  h.turn('GOAL_WAIT', 'completed', { user: true });
+  assert.deepEqual(h.goals.log, ['disarm', 'resume']);
+  h.turn('GOAL_WAIT');
+  assert.deepEqual(h.goals.log, ['disarm', 'resume', 'disarm']);
 });
